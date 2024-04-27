@@ -1,7 +1,12 @@
 jupyter
 ipykernel
-torch
 numpy
 rdkit-pypi
 matplotlib
 tqdm
+wandb
+imageio
+networkx
+torch-geometric
+pandas
+matplotlib

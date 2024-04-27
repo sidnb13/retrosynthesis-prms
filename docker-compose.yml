@@ -1,0 +1,24 @@
+# version: '3.8'
+services:
+  retrosynthesis-prms:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    volumes:
+      - ./:/workspace/retrosynthesis-prms/
+      - ./:/code
+      - ./.vscode-server:/.vscode-server # volume of the vscode plugins
+      - ~/.ssh/github_ed25519:/root/.ssh/github_ed25519 # volume of the ssh keys
+    # set environment variables
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    deploy:
+        resources:
+          reservations:
+            devices:
+              - driver: nvidia
+                count: all
+                capabilities: [gpu]
+    command: tail -f /dev/null
+    ipc: host
+ 
