@@ -1,5 +1,7 @@
 data/*
 !data/*.py
+models/*
+!models/*.py
 .DS_Store
 *.ipynb_checkpoints
 **/__pycache__
