@@ -8,5 +8,6 @@ wandb
 imageio
 networkx
 torch-geometric
+pytorch_lightning
 pandas
 matplotlib
