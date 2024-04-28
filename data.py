@@ -1,5 +1,6 @@
 import functools
 import os
+from collections.abc import Mapping
 from hashlib import md5
 
 import numpy as np
@@ -65,6 +66,48 @@ def clean(line):
     return line.strip().split()[0]
 
 
+def torch_default_data_collator(features):
+    if not isinstance(features[0], Mapping):
+        features = [vars(f) for f in features]
+    first = features[0]
+    batch = {}
+
+    # Special handling for labels.
+    # Ensure that tensor is created with the correct type
+    # (it should be automatically the case, but let's make sure of it.)
+    if "label" in first and first["label"] is not None:
+        label = (
+            first["label"].item()
+            if isinstance(first["label"], torch.Tensor)
+            else first["label"]
+        )
+        dtype = torch.long if isinstance(label, int) else torch.float
+        batch["labels"] = torch.tensor([f["label"] for f in features], dtype=dtype)
+    elif "label_ids" in first and first["label_ids"] is not None:
+        if isinstance(first["label_ids"], torch.Tensor):
+            batch["labels"] = torch.stack([f["label_ids"] for f in features])
+        else:
+            dtype = (
+                torch.long if isinstance(first["label_ids"][0], int) else torch.float
+            )
+            batch["labels"] = torch.tensor(
+                [f["label_ids"] for f in features], dtype=dtype
+            )
+
+    # Handling of all other possible keys.
+    # Again, we will use the first element to figure out which key/values are not None for this model.
+    for k, v in first.items():
+        if k not in ("label", "label_ids") and v is not None and not isinstance(v, str):
+            if isinstance(v, torch.Tensor):
+                batch[k] = torch.stack([f[k] for f in features])
+            elif isinstance(v, np.ndarray):
+                batch[k] = torch.tensor(np.stack([f[k] for f in features]))
+            else:
+                batch[k] = torch.tensor([f[k] for f in features])
+
+    return batch
+
+
 class ProcessSupervisedDataset(Dataset):
     """Finetuning model to generate next step in retrosynthesis."""
 
@@ -85,11 +128,10 @@ class ProcessSupervisedDataset(Dataset):
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.max_length = max_length
 
+        data_cache_path = f"{data_file}_{limit}.pt"
         # process
-        if (
-            not dist.is_initialized()
-            or dist.get_rank() == 0
-            and not os.path.exists(f"{data_file}_{limit}.pt")
+        if not os.path.exists(data_cache_path) and (
+            not dist.is_initialized() or dist.get_rank() == 0
         ):
             seen = set()
             reagents = {}
@@ -123,12 +165,12 @@ class ProcessSupervisedDataset(Dataset):
                         self.data.append((reagents[:i], prod))
 
                     it.set_postfix(reactions=len(self.data), reagents=len(reagents))
-
             # save data
-            torch.save(self.data, f"{data_file}_{limit}.pt")
+            torch.save(self.data, data_cache_path)
         else:
-            dist.barrier()
-            self.data = torch.load(f"{data_file}_{limit}.pt")
+            if dist.is_initialized():
+                dist.barrier()
+            self.data = torch.load(data_cache_path)
 
     def __len__(self):
         return len(self.data)

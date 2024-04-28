@@ -6,12 +6,14 @@ train:
   mode: ft
   steps: 1000
   lr: 3e-5
+  warmup_steps: 100
+  grad_acc_steps: 1
   scheduler: cosine
   weight_decay: 0.01
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
-  train_micro_bsz: 32
-  val_micro_bsz: 16
+  train_micro_bsz: 4
+  val_micro_bsz: 4
   log_interval: 100
   save_interval: 1000
   eval_interval: 500

@@ -6,7 +6,6 @@ import torch
 import torch.distributed as dist
 import wandb
 from omegaconf import DictConfig
-from sentry_sdk import is_initialized
 from torch.distributed.fsdp import FullStateDictConfig, MixedPrecision, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
@@ -19,7 +18,7 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, get_cosine_schedule_with_warmup
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
-from data import ProcessSupervisedDataset
+from data import ProcessSupervisedDataset, torch_default_data_collator
 
 
 def get_policies():
@@ -59,7 +58,7 @@ def train_entrypoint(rank, world_size, config: DictConfig):
     if config.train.fsdp:
         setup(rank, world_size)
 
-    policy = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path,
         device_map="auto" if config.train.fsdp else {"": rank},
     )
@@ -67,8 +66,8 @@ def train_entrypoint(rank, world_size, config: DictConfig):
     # shard with FSDP
     if config.train.fsdp:
         mp_policy, auto_wrap_policy = get_policies()
-        policy = FSDP(
-            policy,
+        model = FSDP(
+            model,
             auto_wrap_policy=auto_wrap_policy,
             mixed_precision=mp_policy,
             limit_all_gathers=True,
@@ -104,6 +103,7 @@ def train_entrypoint(rank, world_size, config: DictConfig):
         shuffle=not config.train.fsdp,
         num_workers=2,
         pin_memory=True,
+        collate_fn=torch_default_data_collator,
     )
     val_loader = DataLoader(
         val_ds,
@@ -111,40 +111,51 @@ def train_entrypoint(rank, world_size, config: DictConfig):
         batch_sampler=test_sampler if config.train.fsdp else None,
         num_workers=2,
         pin_memory=True,
+        collate_fn=torch_default_data_collator,
     )
 
     # setup optimizer and scheduler
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=config.train.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.train.lr)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config.train.warmup_steps,
-        num_training_steps=config.train.steps,
+        num_training_steps=config.train.steps // config.train.grad_acc_steps,
     )
 
     train_iter = itertools.cycle(train_loader)
 
     # train loop
+    model.train()
     for step, batch in enumerate(train_iter):
-        train_step(batch, policy, optimizer, scheduler)
+        train_step(config, rank, step, batch, model, optimizer, scheduler)
+
         if step % config.train.eval_interval == 0:
-            if rank == 0:
-                print("running eval")
-            # evaluate on entire val set
-            val_loss = 0.0
             with torch.no_grad():
-                for val_batch in iter(val_loader):
-                    loss = policy(**val_batch)
-                    val_loss += loss
+                model.eval()
+                if rank == 0:
+                    print("running eval")
+                # evaluate on entire val set
+                val_loss = torch.tensor(0.0, device=rank)
+                with torch.no_grad():
+                    for val_batch in iter(val_loader):
+                        val_batch = {k: v.to(rank) for k, v in val_batch.items()}
+                        loss = model(**val_batch).loss
+                        val_loss += loss
 
-            if dist.is_initialized():
-                dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                if dist.is_initialized():
+                    dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
 
-            if rank == 0:
-                print(
-                    f"step: {step}, avg_loss: {val_loss.item() / len(val_loader):.3f}"
-                )
+                if rank == 0:
+                    print(
+                        f"step: {step}, avg_loss: {val_loss.cpu().item() / len(val_loader):.3f}"
+                    )
         if step % config.train.save_interval == 0:
-            save_model_checkpoint(config, step, policy, rank)
+            save_model_checkpoint(config, step, model, rank)
+
+        if step == config.train.steps:
+            if rank == 0:
+                print("training done")
+            break
 
 
 def save_model_checkpoint(
@@ -153,6 +164,8 @@ def save_model_checkpoint(
     model,
     rank,
 ):
+    if not config.train.do_save:
+        return
     """saving model via rank0 cpu streaming and full_state_dict"""
     fullstate_save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
@@ -174,29 +187,26 @@ def save_model_checkpoint(
 
 
 def train_step(config: DictConfig, rank, step, batch, model, optimizer, scheduler):
-    model.train()
     # move batch to device
     batch = {k: v.to(rank) for k, v in batch.items()}
-    loss = model(**batch) / config.train.grad_accum_steps
+    loss = model(**batch).loss / config.train.grad_acc_steps
 
     loss.backward()
 
-    if (
-        step + 1
-    ) % config.train.grad_accum_steps == 0 or step + 1 == config.train.steps:
-        optimizer.zero_grad()
+    if (step + 1) % config.train.grad_acc_steps == 0 or step + 1 == config.train.steps:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), config.train.max_grad_norm
         )
         optimizer.step()
         scheduler.step()
+        optimizer.zero_grad()
 
     if dist.is_initialized():
         dist.all_reduce(loss, op=dist.ReduceOp.SUM)
 
     metrics = dict(
         step=step,
-        loss=loss.item(),
+        loss=loss.detach().cpu().item(),
         grad_norm=grad_norm.item(),
         lr=optimizer.param_groups[0]["lr"],
     )
@@ -205,5 +215,3 @@ def train_step(config: DictConfig, rank, step, batch, model, optimizer, schedule
         print(metrics)
         if wandb.run:
             wandb.log(metrics)
-
-    return metrics
