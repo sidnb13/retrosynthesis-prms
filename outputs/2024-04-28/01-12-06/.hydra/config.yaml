@@ -1,0 +1,25 @@
+seed: 42
+train:
+  fsdp: false
+  save_dir: checkpoints
+  mode: ft
+  steps: 1000
+  lr: 3.0e-05
+  scheduler: cosine
+  weight_decay: 0.01
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  train_micro_bsz: 32
+  val_micro_bsz: 16
+  log_interval: 100
+  save_interval: 1000
+  eval_interval: 500
+  do_save: false
+data:
+  data_file: ~/retrosynthesis-prms/data/reactions.rsmi
+  max_length: 512
+  limit: -1
+  test_split: 0.1
+model:
+  reward: false
+  name_or_path: gpt2

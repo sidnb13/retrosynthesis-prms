@@ -9,5 +9,8 @@ imageio
 networkx
 torch-geometric
 pytorch_lightning
+hydra-core
+accelerate
+transformers
 pandas
 matplotlib
